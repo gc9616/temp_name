@@ -92,3 +92,31 @@ def illumination_correction(bw_img, safe_mask):
     high_pass = cv2.GaussianBlur(high_pass, (0, 0), 1.2)
     
     return high_pass
+
+
+def highlight_enhance(img, safe_mask, strength=1.5, threshold_percentile=75):
+    """
+    Strengthens any bright patches, highlights on raw features. Goal is to make vessels more visible and pop out:
+
+    brighter = brighter + (brighter - threshold) * (strength - 1.0) * highlight_mask
+    
+    :param img: Input image (uint8)
+    :param safe_mask: Safe area to work on for hand
+    :param strength: multiplier for highlight regions
+    :param threshold_percentile: define what gets highlighted (percentile)
+    """
+
+    # plz no type mismatch plz plz plz
+    img_float = img.astype(np.float32)
+
+    # these are our values of interest
+    vals = img[safe_mask > 0]
+    threshold = np.percentile(vals, threshold_percentile)
+
+    highlight_mask = (img >= threshold).astype(np.float32)
+
+    enhanced = img_float.copy() + (img_float.copy() - threshold) * (strength - 1) * highlight_mask
+
+    enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
+    
+
