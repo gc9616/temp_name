@@ -67,3 +67,28 @@ def segmentation_hand_mask(bw_img):
     safe_mask = (dist > 6).astype(np.uint8) * 255
     
     return hand_mask, safe_mask
+
+def illumination_correction(bw_img, safe_mask):
+    """
+    Make dark veins bright:
+
+    1) Pass through large Gaussian blur to estimate background illumination
+    2) 
+    
+    :param bw_img: Description
+    :param safe_mask: Description
+    """
+
+    background = cv2.GuassianBlur(bw_img,(0,0), 35.0)
+
+    high_pass = cv2.subtract(background, bw_img)
+    high_pass = cv2.bitwise_and(high_pass, high_pass, mask=safe_mask)
+    high_pass = cv2.normalize(high_pass, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # light CLAHE process:
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    high_pass = clahe.apply(high_pass)
+
+    high_pass = cv2.GaussianBlur(high_pass, (0, 0), 1.2)
+    
+    return high_pass
