@@ -103,32 +103,32 @@ This repo includes a small Flask app that exposes a capture endpoint.
 
 ---
 
-## Feature extraction pipeline (current approach)
+## Feature extraction pipeline
 
 > Goal: turn a near-IR palm image into a **stable feature vector**
 
-### 1) Hand segmentation + safe mask (most important stage)
+### 1) Hand segmentation + safe mask
 **Purpose:** isolate the hand region and avoid the boundary where silhouette artifacts dominate.
 
 Typical outputs:
 - `hand_mask`: binary blob of the hand
 - `safe_mask`: eroded/core region that stays away from edges (used everywhere downstream)
 
-Key ideas in your segmentation code:
+Segmentation:
 - Blur → Otsu threshold
 - Flood fill from borders to remove background regions connected to frame edges
 - Largest/most central component selection
 - Morph close/open + hole fill for cleanup
 - Distance transform to generate `safe_mask` (avoid boundary band artifacts)
 
-### 2) Illumination correction (recommended for robustness)
+### 2) Illumination correction
 **Purpose:** remove slow-varying lighting so the algorithm sees veins as local contrast features rather than brightness gradients.
 
 - **“Full” illumination correction**: background blur → subtract → normalize → CLAHE → blur  
   - Pros: makes veins visually pop
   - Cons: CLAHE can introduce nonlinear contrast changes; can hurt descriptor invariance
 
-- **“For features” correction** (preferred for matching):
+- **“For features” correction**:
   - background blur → subtract → robust percentile normalization inside `safe_mask`
   - no CLAHE
   - more photometrically stable for feature vectors
@@ -138,7 +138,7 @@ Key ideas in your segmentation code:
 
 ### 4) Building the feature vector
 
-- **Per-orientation response stack** (don’t max over orientations)
+- **Per-orientation response stack** 
 - **Spatial pooling** (grid pooling) to tolerate small translations
 - **Normalization** (L2 or local block norm) to reduce contrast/illumination sensitivity
 
