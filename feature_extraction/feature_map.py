@@ -646,6 +646,47 @@ def illumination_correction(gray, safe_mask, clahe_clip=3.5, clahe_grid=6, bg_si
     return hp
 
 
+def robust_normalize_u8(img, safe_mask, p_low=2, p_high=98):
+    """
+    Robust percentile-based normalization to uint8.
+    
+    Args:
+        img: Input image (uint8)
+        safe_mask: Mask for valid pixels
+        p_low, p_high: Percentile bounds (default 2, 98)
+    
+    Returns:
+        Normalized uint8 image
+    """
+    vals = img[safe_mask > 0].astype(np.float32)
+    lo, hi = np.percentile(vals, p_low), np.percentile(vals, p_high)
+    x = np.clip(img.astype(np.float32), lo, hi)
+    x = (x - lo) / (hi - lo + 1e-9)  # [0,1]
+    return (x * 255.0).astype(np.uint8)
+
+
+def illumination_correction_for_features(gray, safe_mask, bg_sigma=30.0, p_low=2, p_high=98):
+    """
+    Simplified illumination correction for feature extraction (no CLAHE).
+    
+    High-pass + robust normalize only. Avoids CLAHE sensitivity for better
+    photometric invariance in descriptors.
+    
+    Args:
+        gray: Input grayscale image
+        safe_mask: Safe mask for hand region
+        bg_sigma: Background blur sigma (default 30.0)
+        p_low, p_high: Percentile bounds for normalization (default 2, 98)
+    
+    Returns:
+        hp: Illumination-corrected image (uint8)
+    """
+    bg = cv2.GaussianBlur(gray, (0, 0), bg_sigma)
+    hp = cv2.subtract(bg, gray)
+    hp = cv2.bitwise_and(hp, hp, mask=safe_mask)
+    return robust_normalize_u8(hp, safe_mask, p_low=p_low, p_high=p_high)
+
+
 def strengthen_highlights(img, safe_mask, strength=1.5, threshold_percentile=75):
     """
     Strengthen highlights (bright regions) to make vessels pop more.
@@ -1221,6 +1262,185 @@ def palm_vein_feature_map(gray, use_multiscale=True, enhance=True, create_overla
     return enhanced, resp_u8, safe_mask, overlay, None
 
 
+# -------------------------------------------------------------------
+# OEG (Orientation Energy Grid) feature extraction (Option A)
+# -------------------------------------------------------------------
+
+def _pca_angle_deg_from_mask(mask_u8: np.ndarray) -> float:
+    """Return PCA major-axis angle in degrees (x-axis reference)."""
+    ys, xs = np.where(mask_u8 > 0)
+    if xs.size < 50:
+        return 0.0
+
+    pts = np.stack([xs, ys], axis=1).astype(np.float32)
+    pts -= pts.mean(axis=0, keepdims=True)
+
+    # covariance (2x2)
+    cov = (pts.T @ pts) / max(1, pts.shape[0])
+    eigvals, eigvecs = np.linalg.eigh(cov)  # ascending
+    v = eigvecs[:, int(np.argmax(eigvals))]  # principal axis (x,y)
+
+    # Fix sign ambiguity to avoid random 180 flips:
+    # enforce pointing roughly to +x
+    if v[0] < 0:
+        v = -v
+
+    angle = np.degrees(np.arctan2(v[1], v[0]))  # atan2(y, x)
+    return float(angle)
+
+
+def _rotate_keep_size(img_u8: np.ndarray, mask_u8: np.ndarray, angle_deg: float):
+    """Rotate image+mask about center, keep original size."""
+    if abs(angle_deg) < 1e-3:
+        return img_u8, mask_u8
+
+    h, w = img_u8.shape[:2]
+    center = (w * 0.5, h * 0.5)
+    # rotate by -angle so principal axis aligns with +x
+    M = cv2.getRotationMatrix2D(center, -angle_deg, 1.0)
+
+    img_r = cv2.warpAffine(
+        img_u8, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0
+    )
+    mask_r = cv2.warpAffine(
+        mask_u8, M, (w, h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0
+    )
+    mask_r = (mask_r > 0).astype(np.uint8) * 255
+    return img_r, mask_r
+
+
+def _crop_and_resize(img_u8: np.ndarray, mask_u8: np.ndarray, out_size: int = 256, margin: int = 10):
+    """Crop to mask bbox (+margin) then resize to (out_size, out_size)."""
+    ys, xs = np.where(mask_u8 > 0)
+    if ys.size == 0:
+        z = np.zeros((out_size, out_size), dtype=np.uint8)
+        return z, z
+
+    h, w = img_u8.shape[:2]
+    y0 = max(0, int(ys.min()) - margin)
+    y1 = min(h, int(ys.max()) + margin + 1)
+    x0 = max(0, int(xs.min()) - margin)
+    x1 = min(w, int(xs.max()) + margin + 1)
+
+    img_c = img_u8[y0:y1, x0:x1]
+    m_c = mask_u8[y0:y1, x0:x1]
+
+    img_r = cv2.resize(img_c, (out_size, out_size), interpolation=cv2.INTER_AREA)
+    m_r = cv2.resize(m_c, (out_size, out_size), interpolation=cv2.INTER_NEAREST)
+    m_r = (m_r > 0).astype(np.uint8) * 255
+    return img_r, m_r
+
+
+def _gabor_stack(img_u8: np.ndarray,
+                 ksize: int = 31,
+                 sig: float = 5.0,
+                 lambd: float = 10.0,
+                 gamma: float = 0.5,
+                 psi: float = 0.0,
+                 ntheta: int = 8) -> np.ndarray:
+    """
+    Return stack of ReLU Gabor responses: shape [K, H, W] float32.
+    """
+    thetas = np.linspace(0, np.pi, ntheta, endpoint=False)
+    src = img_u8.astype(np.float32)
+    H, W = img_u8.shape[:2]
+    stack = np.zeros((ntheta, H, W), dtype=np.float32)
+
+    for i, th in enumerate(thetas):
+        kern = cv2.getGaborKernel((ksize, ksize), sig, th, lambd, gamma, psi, ktype=cv2.CV_32F)
+        kern -= kern.mean()
+        r = cv2.filter2D(src, cv2.CV_32F, kern)
+        r = np.maximum(r, 0)  # ReLU
+        stack[i] = r
+
+    return stack
+
+
+def _grid_pool(stack: np.ndarray, mask_u8: np.ndarray, grid: int = 16) -> np.ndarray:
+    """
+    stack: [K,H,W] float32
+    mask_u8: [H,W] uint8 0/255
+    Returns: feature vector float32 length = grid*grid*K
+    
+    Per-cell normalization across orientations for gain invariance.
+    """
+    K, H, W = stack.shape
+    mask = (mask_u8 > 0)
+
+    ys = np.linspace(0, H, grid + 1, dtype=int)
+    xs = np.linspace(0, W, grid + 1, dtype=int)
+
+    feats = []
+    for gy in range(grid):
+        y0, y1 = ys[gy], ys[gy + 1]
+        for gx in range(grid):
+            x0, x1 = xs[gx], xs[gx + 1]
+            m = mask[y0:y1, x0:x1]
+
+            if not np.any(m):
+                feats.extend([0.0] * K)
+                continue
+
+            cell = np.zeros((K,), dtype=np.float32)
+            for k in range(K):
+                v = stack[k, y0:y1, x0:x1][m]
+                cell[k] = float(v.mean())
+
+            # Per-cell normalization across orientations (key for lighting robustness)
+            cell /= (np.linalg.norm(cell) + 1e-6)
+
+            feats.extend(cell.tolist())
+
+    return np.array(feats, dtype=np.float32)
+
+
+def extract_oeg_feature_vector(gray_u8: np.ndarray,
+                               safe_mask_u8: np.ndarray,
+                               roi_size: int = 256,
+                               roi_margin: int = 10,
+                               ntheta: int = 8,
+                               grid: int = 16,
+                               ksize: int = 31,
+                               sig: float = 5.0,
+                               lambd: float = 10.0,
+                               gamma: float = 0.5) -> np.ndarray:
+    """
+    Pipeline:
+      1) hp = illumination_correction_for_features(gray, safe_mask)  # No CLAHE for invariance
+      2) PCA rotate (small rotation tolerance)
+      3) crop + resize ROI
+      4) per-orientation Gabor stack
+      5) grid pooling with per-cell orientation normalization
+      6) L2 normalize
+    """
+    # Use simplified illumination correction (no CLAHE) for better photometric invariance
+    hp = illumination_correction_for_features(gray_u8, safe_mask_u8)
+
+    # PCA align using safe_mask
+    angle = _pca_angle_deg_from_mask(safe_mask_u8)
+    hp_a, mask_a = _rotate_keep_size(hp, safe_mask_u8, angle)
+
+    # Crop + resize to canonical ROI
+    hp_r, mask_r = _crop_and_resize(hp_a, mask_a, out_size=roi_size, margin=roi_margin)
+
+    # Oriented response stack (do NOT max across orientations)
+    stack = _gabor_stack(hp_r, ksize=ksize, sig=sig, lambd=lambd, gamma=gamma, psi=0.0, ntheta=ntheta)
+
+    # Grid pooling (translation tolerant)
+    vec = _grid_pool(stack, mask_r, grid=grid)
+
+    # L2 normalize
+    n = float(np.linalg.norm(vec) + 1e-6)
+    vec = (vec / n).astype(np.float32)
+    return vec
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract palm vein feature maps from grayscale images",
@@ -1305,6 +1525,32 @@ Examples:
     parser.add_argument("--finger-width", type=int, default=60,
                        help="Max finger width in pixels for exclusion (default: 60)")
     
+    # ----------------------------
+    # Feature vector mode (OEG)
+    # ----------------------------
+    parser.add_argument("--feature-vector", action="store_true", default=False,
+                        help="Compute and save OEG feature vector only (no images)")
+    parser.add_argument("--vec-out", type=Path, default=None,
+                        help="Output path prefix for vector (default: output_dir/<stem>_oeg)")
+    parser.add_argument("--vec-grid", type=int, default=16,
+                        help="Grid size for pooling (default: 16)")
+    parser.add_argument("--vec-ntheta", type=int, default=8,
+                        help="Number of Gabor orientations (default: 8)")
+    parser.add_argument("--roi-size", type=int, default=256,
+                        help="Canonical ROI size (default: 256)")
+    parser.add_argument("--roi-margin", type=int, default=10,
+                        help="Crop margin in pixels before resize (default: 10)")
+
+    # Gabor params for feature extraction (leave defaults unless tuning)
+    parser.add_argument("--vec-ksize", type=int, default=31,
+                        help="Gabor kernel size for vector extraction (default: 31)")
+    parser.add_argument("--vec-sigma", type=float, default=5.0,
+                        help="Gabor sigma for vector extraction (default: 5.0)")
+    parser.add_argument("--vec-lambda", type=float, default=10.0,
+                        help="Gabor lambda for vector extraction (default: 10.0)")
+    parser.add_argument("--vec-gamma", type=float, default=0.5,
+                        help="Gabor gamma for vector extraction (default: 0.5)")
+    
     args = parser.parse_args()
     
     # Validate input
@@ -1320,6 +1566,56 @@ Examples:
     # Read image
     print(f"Reading image: {args.input}")
     gray = read_image_grayscale(args.input)
+    
+    # ------------------------------------------------------------
+    # Feature vector mode: compute OEG vector and exit
+    # ------------------------------------------------------------
+    if args.feature_vector:
+        # Build masks using the SAME segmentation config as your pipeline
+        hand_mask, safe_mask = create_hand_segmentation_mask(
+            gray,
+            method=args.segmentation,
+            preprocess=args.preprocess_seg,
+            otsu_bias=args.otsu_bias,
+            canny_low=args.canny_low,
+            canny_high=args.canny_high,
+            exclude_fingers_flag=True,
+            finger_width=args.finger_width
+        )
+
+        vec = extract_oeg_feature_vector(
+            gray, safe_mask,
+            roi_size=args.roi_size,
+            roi_margin=args.roi_margin,
+            ntheta=args.vec_ntheta,
+            grid=args.vec_grid,
+            ksize=args.vec_ksize,
+            sig=args.vec_sigma,
+            lambd=args.vec_lambda,
+            gamma=args.vec_gamma
+        )
+
+        stem = args.input.stem
+        if args.output is None:
+            args.output = args.input.parent / "vein_feature_maps"
+        args.output.mkdir(parents=True, exist_ok=True)
+
+        prefix = args.vec_out
+        if prefix is None:
+            prefix = args.output / f"{stem}_oeg"
+
+        # Save
+        np.save(str(prefix) + ".npy", vec)
+        np.savetxt(str(prefix) + ".txt", vec[None, :], fmt="%.8g")
+
+        # Print full vector to terminal (one line)
+        print(" ".join(f"{x:.8g}" for x in vec))
+        print(f"\nSaved feature vector:")
+        print(f"  npy: {str(prefix) + '.npy'}")
+        print(f"  txt: {str(prefix) + '.txt'}")
+        print(f"  dim: {vec.size} (grid={args.vec_grid}, ntheta={args.vec_ntheta})")
+
+        sys.exit(0)
     
     # Run pipeline
     print(f"Running palm vein feature extraction pipeline (segmentation: {args.segmentation})...")
