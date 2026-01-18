@@ -26,15 +26,9 @@ This repo contains:
 - **Battery power**
   - **12V battery pack**: 8× AA in a battery case providing 12 volts of power.
   - Battery power soldered to 850 nm light.
+- **3D prints**
+   - Housing for electronics and phone designed in Solidworks and printed with 8% infill PLA
 
-### Physical setup notes (what matters most)
-- **Consistency** beats everything:
-  - fixed standoff distance (simple jig/guide)
-  - fixed ROI alignment (printed outline / physical palm rest)
-  - stable IR brightness
-- Avoid glossy reflections:
-  - diffuse the IR panel if needed (thin diffuser, paper, etc.)
-  - tune exposure to avoid saturation
 
 ---
 
