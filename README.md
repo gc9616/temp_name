@@ -20,14 +20,12 @@ This repo contains:
 - **Raspberry Pi 3 (32-bit OS)**  
   - Constraint: CPU-only, limited RAM; heavy OpenCV pipelines can be slow at full resolution.
 - **Arducam (NOIR)** camera module  
-  - NOIR = no IR-cut filter → works well with near-IR illumination.
+  - NIR = no IR-cut filter → works well with near-IR illumination.
 - **External IR illumination panel**
   - Near-IR LED panel (commonly 850nm; 940nm also possible but often dimmer on typical sensors).
 - **Battery power**
-  - **12V battery pack**: 8× AA in a battery case (approx. 12V with alkalines / ~9.6V with NiMH)
-  - Important: Raspberry Pi needs **5V regulated** input. If you’re powering the Pi from the same pack:
-    - Use a **buck converter** (12V → 5V) rated for at least **2.5A**
-    - Keep grounds common if the camera/LED controller needs it, but avoid noise coupling where possible.
+  - **12V battery pack**: 8× AA in a battery case providing 12 volts of power.
+  - Battery power soldered to 850 nm light.
 
 ### Physical setup notes (what matters most)
 - **Consistency** beats everything:
