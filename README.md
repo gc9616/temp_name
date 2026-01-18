@@ -1,6 +1,6 @@
 # HemiSec — Palm Vein Biometric Capture (Raspberry Pi)
 
-A hardware + software prototype for **palm-vein biometric capture** using near-IR imaging on a Raspberry Pi. The system captures a palm image under IR illumination and runs a feature-extraction pipeline (or forwards the image to a server for downstream comparison).
+A hardware + software prototype for **palm-vein biometric capture** using near-IR imaging on a Raspberry Pi. The system captures a palm image under NIR illumination and runs a feature-extraction pipeline, then forwards the image to a server for downstream comparison.
 
 ## Elevator pitch
 **Fast, IR-based palm-vein capture on a Raspberry Pi for lightweight biometric identity verification.**
@@ -12,10 +12,6 @@ This repo contains:
 - **Raspberry Pi capture software** (camera → image files and/or API endpoint)
 - A **palm-vein feature extraction pipeline** (segmentation → illumination correction → filter-bank response → feature vector)
 - A simple **Flask API** (capture request → returns image or derived feature vector)
-- Scripts/utilities for **debugging**, **testing**, and **local comparisons**
-
-> This is a prototype/hackathon-style codebase: the goal is to capture consistently and iterate fast on extraction/matching.
-
 ---
 
 ## Hardware overview
@@ -84,21 +80,15 @@ python -m pip install -U pip
 
 ## 3) Install Python requirements
 
-If you have a minimal `requirements.txt`, use:
-
 ```bash
 pip install -r requirements.txt
 ```
-
-**Important:** Do *not* use an exported conda environment file as `requirements.txt` on the Pi (it will contain `@ file:///croot/...` entries that do not exist on the Pi).
 
 Minimal typical deps for this project:
 - `numpy`
 - `opencv-python` (or `python3-opencv` via apt)
 - `scikit-image` (only if you rely on it; avoid if you want speed)
 - `flask`
-- `requests` (if posting images off-device)
-
 ---
 
 ## Capturing images (CLI)
