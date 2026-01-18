@@ -1,58 +1,54 @@
+#!/usr/bin/env python3
+"""
+Palm Vein Feature Map Extraction Pipeline
+
+Implements a complete pipeline for extracting vessel-enhanced feature maps from palm images.
+Based on Gabor filter banks, hand segmentation, and illumination correction.
+
+Outputs:
+1. Enhanced vessel feature map (final product for feature extraction)
+2. Red overlay visualization (debug/visualization)
+"""
+
+import argparse
 import sys
 from pathlib import Path
-import argparse
-
 import cv2
 import numpy as np
-from skimage import morphology
+from skimage.morphology import skeletonize, remove_small_objects
 
-# Pipeline works like this:
-# 1. Load image as grayscale
-# 2. Segment palm area
-# 3. Correct illumination & exposure issues
-# 4. (Optional) Enhance illumination in certain areas on correct img to make vessels more obvious
-# 5. Single-scale vessel response with Gabor filter
-# 6. Multi-scale vessel response to check for different size veins
-# 7. Enhance feature map, send to post processing unit
-# 8. Generate a red overlay to get good visual of what the pipeline sees as "veins"
 
-def load_grayscale(path:str):
+def read_image_grayscale(path):
+    """A1) Read image as grayscale."""
+    gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if gray is None:
+        raise RuntimeError(f"Could not read image: {path}")
+    return gray
+
+
+def create_hand_segmentation_mask(gray):
     """
-    Loads image in grayscale, returns as a **UINT8 array**.
+    A2) Hand segmentation mask (largest bright component).
     
-    :param path: image path
-    :type path: str
+    Steps:
+    1. Blur + Otsu thresholding
+    2. Largest connected component
+    3. Morphological cleanup
+    4. Safe mask via distance transform (avoids boundary artifacts)
     """
-    bw = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-    if bw is None:
-        raise RuntimeError(f"check path: {path}")
-    return bw
-
-def segmentation_hand_mask(bw_img):
-    """
-    Segment the image of the hand so that we draw on an extract features from only the palm (here is calculated as simply the brightest component. Probably have to make this more sophisticated down the line).
-
-    1) Blur + Otsu threshold
-    2) Find biggest continuous shape
-    3) Morpho cleanup
-    4) Pad region with extra space to avoid background getting considered for features. 
+    # Blur + Otsu
+    blur = cv2.GaussianBlur(gray, (0, 0), 3.0)
+    _, thr = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    :param bw_img: grayscale image
-    """
-
-    smoothed = cv2.GaussianBlur(bw_img, (0, 0), 3.0)
-
-    _, threshold = cv2.threshold(smoothed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # FIX: correct OpenCV function name
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(threshold, connectivity=8)
-
+    # Largest connected component
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thr, connectivity=8)
     if num_labels > 1:
         largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
         hand_mask = (labels == largest).astype(np.uint8) * 255
     else:
-        hand_mask = threshold.copy()
-
+        hand_mask = thr.copy()
+    
+    # Morph cleanup
     hand_mask = cv2.morphologyEx(
         hand_mask, cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)),
@@ -63,160 +59,78 @@ def segmentation_hand_mask(bw_img):
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
         iterations=1
     )
-
+    
+    # Safe mask via distance transform (key to avoid boundary artifacts)
+    # DIST_L2, maskSize 5, threshold > 6
     dist = cv2.distanceTransform(hand_mask, cv2.DIST_L2, 5)
     safe_mask = (dist > 6).astype(np.uint8) * 255
     
     return hand_mask, safe_mask
 
-def pre_enhance_input(bw_img, safe_mask,
-                      denoise=True,
-                      denoise_method="bilateral",
-                      denoise_strength="light",
-                      apply_clahe=True,
-                      clahe_clip_limit=1.5,
-                      clahe_tile_grid_size=(8, 8),
-                      contrast_alpha=1.05,
-                      contrast_beta=0,
-                      gamma=None,
-                      sharpen=False,
-                      sharpen_strength=0.35,
-                      sharpen_sigma=1.0):
+
+def illumination_correction(gray, safe_mask):
     """
-    Optional filters that apply to the ORIGINAL image (or lightly-CLAHE'd original),
-    before illumination correction.
-
-    Keep this gentle for repeatability (verification). Avoid percentile boosts here.
-    """
-    if bw_img.dtype != np.uint8:
-        img = np.clip(bw_img, 0, 255).astype(np.uint8)
-    else:
-        img = bw_img
-
-    if safe_mask is None:
-        safe = np.ones_like(img, dtype=np.uint8) * 255
-    else:
-        safe = (safe_mask > 0).astype(np.uint8) * 255
-
-    # Always restrict to palm-safe area first
-    out = cv2.bitwise_and(img, img, mask=safe)
-
-    # 1) Gentle denoise
-    if denoise:
-        if denoise_method == "bilateral":
-            if denoise_strength == "light":
-                out = cv2.bilateralFilter(out, 5, 40, 40)
-            elif denoise_strength == "medium":
-                out = cv2.bilateralFilter(out, 5, 70, 70)
-            else:
-                out = cv2.bilateralFilter(out, 7, 95, 95)
-        elif denoise_method == "median":
-            k = 3 if denoise_strength == "light" else (5 if denoise_strength == "medium" else 7)
-            out = cv2.medianBlur(out, k)
-        elif denoise_method == "nlm":
-            h = 6 if denoise_strength == "light" else (9 if denoise_strength == "medium" else 12)
-            out = cv2.fastNlMeansDenoising(out, None, h=h, templateWindowSize=7, searchWindowSize=21)
-        elif denoise_method == "both":
-            out = cv2.medianBlur(out, 3)
-            if denoise_strength == "light":
-                out = cv2.bilateralFilter(out, 5, 40, 40)
-            elif denoise_strength == "medium":
-                out = cv2.bilateralFilter(out, 5, 70, 70)
-            else:
-                out = cv2.bilateralFilter(out, 7, 95, 95)
-        else:
-            raise ValueError(f"Unknown denoise_method: {denoise_method}")
-
-        out = cv2.bitwise_and(out, out, mask=safe)
-
-    # 2) Light CLAHE
-    if apply_clahe:
-        clahe = cv2.createCLAHE(clipLimit=float(clahe_clip_limit), tileGridSize=clahe_tile_grid_size)
-        out = clahe.apply(out)
-        out = cv2.bitwise_and(out, out, mask=safe)
-
-    # 3) Optional mild gamma
-    if gamma is not None and abs(float(gamma) - 1.0) > 1e-6:
-        x = out.astype(np.float32) / 255.0
-        x = np.power(np.clip(x, 0.0, 1.0), float(gamma))
-        out = (x * 255.0).astype(np.uint8)
-        out = cv2.bitwise_and(out, out, mask=safe)
-
-    # 4) Optional mild global contrast
-    if abs(float(contrast_alpha) - 1.0) > 1e-6 or int(contrast_beta) != 0:
-        out = cv2.convertScaleAbs(out, alpha=float(contrast_alpha), beta=int(contrast_beta))
-        out = cv2.bitwise_and(out, out, mask=safe)
-
-    # 5) Optional gentle unsharp (usually OFF for verification)
-    if sharpen:
-        blurred = cv2.GaussianBlur(out, (0, 0), float(sharpen_sigma))
-        out_f = out.astype(np.float32)
-        bl_f = blurred.astype(np.float32)
-        out = np.clip(out_f + (out_f - bl_f) * float(sharpen_strength), 0, 255).astype(np.uint8)
-        out = cv2.bitwise_and(out, out, mask=safe)
-
-    return out
-
-def illumination_correction(bw_img, safe_mask):
-    """
-    Make dark veins bright:
-
-    1) Pass through large Gaussian blur to estimate background illumination
-    2) 
+    A3) Illumination correction (veins dark → become bright).
     
-    :param bw_img: Description
-    :param safe_mask: Description
+    Parameters:
+    - background blur sigma = 35.0
+    - CLAHE: clipLimit = 2.0, tileGridSize = (8,8)
+    - post blur sigma = 1.2
     """
-
-    # FIX: correct OpenCV function name
-    background = cv2.GaussianBlur(bw_img, (0, 0), 35.0)
-
-    high_pass = cv2.subtract(background, bw_img)
-    high_pass = cv2.bitwise_and(high_pass, high_pass, mask=safe_mask)
-    high_pass = cv2.normalize(high_pass, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    # light CLAHE process:
+    # Background blur
+    bg = cv2.GaussianBlur(gray, (0, 0), 35.0)
+    
+    # High-pass: dark veins -> brighter
+    hp = cv2.subtract(bg, gray)
+    hp = cv2.bitwise_and(hp, hp, mask=safe_mask)
+    hp = cv2.normalize(hp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    
+    # CLAHE
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    high_pass = clahe.apply(high_pass)
-
-    high_pass = cv2.GaussianBlur(high_pass, (0, 0), 1.2)
+    hp = clahe.apply(hp)
     
-    return high_pass
-
-
-def highlight_enhance(img, safe_mask, strength=1.5, threshold_percentile=75):
-    """
-    Strengthens any bright patches, highlights on raw features. Goal is to make vessels more visible and pop out:
-
-    brighter = brighter + (brighter - threshold) * (strength - 1.0) * highlight_mask
+    # Post blur
+    hp = cv2.GaussianBlur(hp, (0, 0), 1.2)
     
-    :param img: Input image (uint8)
-    :param safe_mask: Safe area to work on for hand
-    :param strength: multiplier for highlight regions
-    :param threshold_percentile: define what gets highlighted (percentile)
-    """
+    return hp
 
-    # plz no type mismatch plz plz plz
+
+def strengthen_highlights(img, safe_mask, strength=1.5, threshold_percentile=75):
+    """
+    Strengthen highlights (bright regions) to make vessels pop more.
+    
+    Args:
+        img: Input image (uint8)
+        safe_mask: Safe mask for hand region
+        strength: Multiplier for highlight regions (default 1.5)
+        threshold_percentile: Percentile to define "highlight" regions (default 75)
+    
+    Returns:
+        Enhanced image with stronger highlights
+    """
     img_float = img.astype(np.float32)
-
-    # these are our values of interest
+    
+    # Find highlight threshold
     vals = img[safe_mask > 0]
     threshold = np.percentile(vals, threshold_percentile)
-
+    
+    # Create highlight mask (bright regions)
     highlight_mask = (img >= threshold).astype(np.float32)
-
-    enhanced = img_float.copy() + (img_float.copy() - threshold) * (strength - 1) * highlight_mask
-
+    
+    # Strengthen highlights: boost bright regions
+    enhanced = img_float.copy()
+    enhanced = enhanced + (enhanced - threshold) * (strength - 1.0) * highlight_mask
+    
+    # Clip and convert back
     enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
-    # FIX: mask keyword + argument order
     enhanced = cv2.bitwise_and(enhanced, enhanced, mask=safe_mask)
-
+    
     return enhanced
 
 
 def enhance_contrast(img, safe_mask, alpha=1.2, beta=0):
     """
-    Contrast filter
+    Enhance contrast using linear transformation.
     
     Args:
         img: Input image (uint8)
@@ -234,7 +148,7 @@ def enhance_contrast(img, safe_mask, alpha=1.2, beta=0):
 
 def strengthen_shadows(img, safe_mask, strength=1.3, threshold_percentile=25):
     """
-    Shadow filter - simulates turning up shadow knob on photo editing software
+    Strengthen shadows (dark regions) to enhance contrast.
     
     Args:
         img: Input image (uint8)
@@ -251,12 +165,14 @@ def strengthen_shadows(img, safe_mask, strength=1.3, threshold_percentile=25):
     vals = img[safe_mask > 0]
     threshold = np.percentile(vals, threshold_percentile)
     
+    # Create shadow mask (dark regions)
     shadow_mask = (img <= threshold).astype(np.float32)
     
     # Strengthen shadows: darken dark regions
     enhanced = img_float.copy()
     enhanced = enhanced - (threshold - enhanced) * (strength - 1.0) * shadow_mask
     
+    # Clip and convert back
     enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
     enhanced = cv2.bitwise_and(enhanced, enhanced, mask=safe_mask)
     
@@ -276,22 +192,24 @@ def sharpen_image(img, safe_mask, strength=1.5, sigma=1.0):
     Returns:
         Sharpened image
     """
-    # get low signals
+    # Create unsharp mask
     blurred = cv2.GaussianBlur(img, (0, 0), sigma)
     
-    # emphasize high signals by adding the original minus low signals. 
+    # Unsharp masking: original + (original - blurred) * strength
     img_float = img.astype(np.float32)
     blurred_float = blurred.astype(np.float32)
     sharpened = img_float + (img_float - blurred_float) * strength
     
+    # Clip and convert back
     sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
     sharpened = cv2.bitwise_and(sharpened, sharpened, mask=safe_mask)
     
     return sharpened
 
+
 def reduce_noise_bilateral(img, safe_mask, d=5, sigma_color=50, sigma_space=50):
     """
-    Reduce noise using bilateral filter (presrve edges)
+    Reduce noise while preserving edges using bilateral filter.
     
     Args:
         img: Input image (uint8)
@@ -310,7 +228,7 @@ def reduce_noise_bilateral(img, safe_mask, d=5, sigma_color=50, sigma_space=50):
 
 def reduce_noise_median(img, safe_mask, ksize=3):
     """
-    Reduce flaky noise filter.
+    Reduce salt-and-pepper noise using median filter.
     
     Args:
         img: Input image (uint8)
@@ -348,7 +266,7 @@ def reduce_noise_nlm(img, safe_mask, h=10, template_window_size=7, search_window
 
 def remove_small_noise_morph(img, safe_mask, min_size=5):
     """
-    Remove small noise blobs using morpho.
+    Remove small noise blobs using morphological operations.
     
     Args:
         img: Input image (uint8)
@@ -358,22 +276,112 @@ def remove_small_noise_morph(img, safe_mask, min_size=5):
     Returns:
         Cleaned image
     """
+    # Threshold to get binary (keep bright regions)
     _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     binary = cv2.bitwise_and(binary, binary, mask=safe_mask)
     
     # Remove small objects
-    # FIX: use min_size argument (max_size will error on many installs)
-    binary_clean = morphology.remove_small_objects(binary.astype(bool), min_size=min_size)
+    binary_clean = remove_small_objects(binary.astype(bool), max_size=min_size - 1)
     binary_clean = (binary_clean.astype(np.uint8) * 255)
     
+    # Apply cleaned mask to original
     cleaned = cv2.bitwise_and(img, img, mask=binary_clean)
     cleaned = cv2.bitwise_and(cleaned, cleaned, mask=safe_mask)
     
     return cleaned
 
+
+def enhance_illumination_corrected(hp, safe_mask, 
+                                   highlight_strength=1.5,
+                                   contrast_alpha=1.2,
+                                   shadow_strength=1.2,
+                                   sharpen_strength=1.3,
+                                   sharpen_sigma=1.0,
+                                   denoise=True,
+                                   denoise_method='bilateral',
+                                   denoise_strength='medium',
+                                   remove_small_noise=True):
+    """
+    Comprehensive enhancement of illumination-corrected image.
+    
+    Applies a pipeline of enhancements to make vessels pop:
+    1. Initial denoising (if enabled)
+    2. Highlight strengthening (makes bright vessel areas stronger)
+    3. Contrast enhancement
+    4. Shadow strengthening (enhances contrast)
+    5. Sharpening (makes edges crisper)
+    6. Final denoising (if enabled)
+    7. Small noise removal (morphological cleanup)
+    
+    Args:
+        hp: Illumination-corrected image (from illumination_correction)
+        safe_mask: Safe mask for hand region
+        highlight_strength: Strength of highlight enhancement (default 1.5)
+        contrast_alpha: Contrast multiplier (default 1.2)
+        shadow_strength: Shadow strengthening factor (default 1.2)
+        sharpen_strength: Sharpening strength (default 1.3)
+        sharpen_sigma: Sharpening blur sigma (default 1.0)
+        denoise: Whether to apply denoising (default True)
+        denoise_method: 'bilateral', 'median', 'nlm', or 'both' (default 'bilateral')
+        denoise_strength: 'light', 'medium', or 'strong' (default 'medium')
+        remove_small_noise: Whether to remove small noise blobs (default True)
+    
+    Returns:
+        Enhanced illumination-corrected image
+    """
+    enhanced = hp.copy()
+    
+    # 0. Initial denoising (if enabled) - reduces noise before enhancement
+    if denoise:
+        if denoise_method == 'bilateral':
+            if denoise_strength == 'light':
+                enhanced = reduce_noise_bilateral(enhanced, safe_mask, d=5, sigma_color=50, sigma_space=50)
+            elif denoise_strength == 'medium':
+                enhanced = reduce_noise_bilateral(enhanced, safe_mask, d=5, sigma_color=75, sigma_space=75)
+            else:  # strong
+                enhanced = reduce_noise_bilateral(enhanced, safe_mask, d=7, sigma_color=100, sigma_space=100)
+        elif denoise_method == 'median':
+            ksize = 3 if denoise_strength == 'light' else (5 if denoise_strength == 'medium' else 7)
+            enhanced = reduce_noise_median(enhanced, safe_mask, ksize=ksize)
+        elif denoise_method == 'nlm':
+            h = 7 if denoise_strength == 'light' else (10 if denoise_strength == 'medium' else 15)
+            enhanced = reduce_noise_nlm(enhanced, safe_mask, h=h)
+        elif denoise_method == 'both':
+            # Apply both median (salt-pepper) and bilateral (general noise)
+            enhanced = reduce_noise_median(enhanced, safe_mask, ksize=3)
+            if denoise_strength == 'light':
+                enhanced = reduce_noise_bilateral(enhanced, safe_mask, d=5, sigma_color=50, sigma_space=50)
+            elif denoise_strength == 'medium':
+                enhanced = reduce_noise_bilateral(enhanced, safe_mask, d=5, sigma_color=75, sigma_space=75)
+            else:  # strong
+                enhanced = reduce_noise_bilateral(enhanced, safe_mask, d=7, sigma_color=100, sigma_space=100)
+    
+    # 1. Strengthen highlights (vessels are bright in hp)
+    enhanced = strengthen_highlights(enhanced, safe_mask, strength=highlight_strength)
+    
+    # 2. Enhance contrast
+    enhanced = enhance_contrast(enhanced, safe_mask, alpha=contrast_alpha)
+    
+    # 3. Strengthen shadows (enhances overall contrast)
+    enhanced = strengthen_shadows(enhanced, safe_mask, strength=shadow_strength)
+    
+    # 4. Sharpen (makes vessel edges crisper)
+    enhanced = sharpen_image(enhanced, safe_mask, strength=sharpen_strength, sigma=sharpen_sigma)
+    
+    # 5. Final denoising pass (light, to clean up after sharpening)
+    if denoise and denoise_method != 'nlm':  # Skip if already did NLM (it's slow)
+        enhanced = reduce_noise_bilateral(enhanced, safe_mask, d=5, sigma_color=50, sigma_space=50)
+    
+    # 6. Remove small noise blobs (morphological cleanup)
+    if remove_small_noise:
+        enhanced = remove_small_noise_morph(enhanced, safe_mask, min_size=5)
+    
+    return enhanced
+
+
 def gabor_bank(img_u8, ksize, sig, lambd, gamma=0.5, psi=0.0, ntheta=12):
     """
-    Gabor filter bank for vessel/ridge response. Baisc idea is that veins look like Gaussians, we exploit that an try to match a Guassian template to things that look like vessels at n different angles.
+    A4) Gabor filter bank for vessel/ridge response.
     
     Parameters:
     - ksize: kernel size
@@ -393,16 +401,17 @@ def gabor_bank(img_u8, ksize, sig, lambd, gamma=0.5, psi=0.0, ntheta=12):
         kern = cv2.getGaborKernel((ksize, ksize), sig, th, lambd, gamma, psi, ktype=cv2.CV_32F)
         kern -= kern.mean()  # IMPORTANT: zero-mean kernel
         r = cv2.filter2D(src, cv2.CV_32F, kern)
-        r = np.maximum(r, 0)  # keep the max ridge-like (veins) positive response
+        r = np.maximum(r, 0)  # keep ridge-like positive response
         resp_max = np.maximum(resp_max, r)
     
     return resp_max
 
-def vessel_response_single_scale(high_pass, safe_mask, ksize=31, sig=5.0, lambd=10.0, gamma=0.5, ntheta=12):
+
+def vessel_response_single_scale(hp, safe_mask, ksize=31, sig=5.0, lambd=10.0, gamma=0.5, ntheta=12):
     """
-    Single-scale vessel response (baseline).
+    A4) Single-scale vessel response (baseline).
     
-    Default params:
+    Exact params:
     - ksize = 31
     - sigma = 5.0
     - lambda = 10.0
@@ -410,7 +419,7 @@ def vessel_response_single_scale(high_pass, safe_mask, ksize=31, sig=5.0, lambd=
     - psi = 0
     - num_orientations = 12
     """
-    resp_max = gabor_bank(high_pass, ksize, sig, lambd, gamma, psi=0.0, ntheta=ntheta)
+    resp_max = gabor_bank(hp, ksize, sig, lambd, gamma, psi=0.0, ntheta=ntheta)
     
     # Normalize to uint8
     resp_u8 = cv2.normalize(resp_max, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -419,7 +428,7 @@ def vessel_response_single_scale(high_pass, safe_mask, ksize=31, sig=5.0, lambd=
     return resp_u8, resp_max
 
 
-def vessel_response_multiscale(high_pass, safe_mask):
+def vessel_response_multiscale(hp, safe_mask):
     """
     B2) Multi-scale vessel response (captures thin + thick veins).
     
@@ -429,11 +438,11 @@ def vessel_response_multiscale(high_pass, safe_mask):
     
     Returns normalized and maxed response.
     """
-    # get the tiny vessels
-    resp_fine = gabor_bank(high_pass, 31, 5.0, 10.0, gamma=0.5, ntheta=12)
+    # Fine scale (thin vessels)
+    resp_fine = gabor_bank(hp, 31, 5.0, 10.0, gamma=0.5, ntheta=12)
     
-    # BIG
-    resp_coarse = gabor_bank(high_pass, 51, 8.0, 18.0, gamma=0.7, ntheta=10)
+    # Coarse scale (thicker vessels)
+    resp_coarse = gabor_bank(hp, 51, 8.0, 18.0, gamma=0.7, ntheta=10)
     
     # Normalize each to [0,1] then max
     rf_min, rf_max = resp_fine.min(), resp_fine.max()
@@ -453,7 +462,7 @@ def vessel_response_multiscale(high_pass, safe_mask):
 
 def enhance_vessel_map(resp_u8, safe_mask, gamma=0.5, p_low=1, p_high=99):
     """
-    Normalize within hand + apply gamma (makes vessels more obvious).
+    B1) Normalize within hand + apply gamma (makes vessels more obvious).
     
     Parameters:
     - gamma: 0.5 (brighten midrange vessel responses)
@@ -485,6 +494,7 @@ def create_red_overlay(gray, resp_u8, safe_mask, percentile_thresh=92.5, min_siz
     - percentile_thresh: typical 92-96 (default 92.5)
     - min_size: minimum object size for removal (default 140)
     """
+    # Percentile threshold
     vals = resp_u8[safe_mask > 0]
     t = np.percentile(vals, percentile_thresh)
     binv = (resp_u8 >= t) & (safe_mask > 0)
@@ -492,8 +502,7 @@ def create_red_overlay(gray, resp_u8, safe_mask, percentile_thresh=92.5, min_siz
     # Remove small objects
     # Note: newer scikit-image uses max_size (removes objects <= max_size)
     # So to remove objects < min_size, we use max_size = min_size - 1
-    # FIX: use min_size argument (max_size will error on many installs)
-    binv = morphology.remove_small_objects(binv.astype(bool), min_size=min_size)
+    binv = remove_small_objects(binv.astype(bool), max_size=min_size - 1)
     bin_u8 = (binv.astype(np.uint8) * 255)
     
     # Morphological close
@@ -504,13 +513,15 @@ def create_red_overlay(gray, resp_u8, safe_mask, percentile_thresh=92.5, min_siz
     )
     
     # Skeletonize
-    sk = morphology.skeletonize(bin_u8 > 0).astype(np.uint8) * 255
+    sk = skeletonize(bin_u8 > 0).astype(np.uint8) * 255
     sk = cv2.dilate(sk, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
     
+    # Create red overlay
     overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     overlay[sk > 0] = (0, 0, 255)
     
     return overlay, sk
+
 
 def palm_vein_feature_map(gray, use_multiscale=True, enhance=True, create_overlay=True,
                           use_illumination_as_feature=False,
@@ -551,31 +562,29 @@ def palm_vein_feature_map(gray, use_multiscale=True, enhance=True, create_overla
         overlay: Red overlay visualization (BGR) if create_overlay=True, else None
         hp_enhanced: Enhanced illumination-corrected image (if use_illumination_as_feature)
     """
-    hand_mask, safe_mask = segmentation_hand_mask(gray)
-
-    # (Optional) Enhance illumination in certain areas on correct img to make vessels more obvious
-    # NOTE: per your intended behavior, this applies to the ORIGINAL image before illumination_correction
-    gray_pre = gray
-    if enhance_illumination:
-        gray_pre = pre_enhance_input(
-            gray, safe_mask,
-            denoise=denoise,
-            denoise_method=denoise_method,
-            denoise_strength=denoise_strength,
-            apply_clahe=True,
-            clahe_clip_limit=1.5,
-            clahe_tile_grid_size=(8, 8),
-            contrast_alpha=1.05,
-            contrast_beta=0,
-            gamma=None,
-            sharpen=False
-        )
+    # A2) Hand segmentation
+    hand_mask, safe_mask = create_hand_segmentation_mask(gray)
     
-    hp = illumination_correction(gray_pre, safe_mask)
+    # A3) Illumination correction
+    hp = illumination_correction(gray, safe_mask)
     
     # Option: Use enhanced illumination-corrected as final feature map
     if use_illumination_as_feature:
-        hp_enhanced = hp.copy()
+        if enhance_illumination:
+            hp_enhanced = enhance_illumination_corrected(
+                hp, safe_mask,
+                highlight_strength=highlight_strength,
+                contrast_alpha=contrast_alpha,
+                shadow_strength=shadow_strength,
+                sharpen_strength=sharpen_strength,
+                sharpen_sigma=sharpen_sigma,
+                denoise=denoise,
+                denoise_method=denoise_method,
+                denoise_strength=denoise_strength,
+                remove_small_noise=remove_small_noise
+            )
+        else:
+            hp_enhanced = hp.copy()
         
         # Use enhanced illumination-corrected as the final feature map
         enhanced = hp_enhanced
@@ -681,7 +690,7 @@ Examples:
     
     # Read image
     print(f"Reading image: {args.input}")
-    gray = load_grayscale(str(args.input))
+    gray = read_image_grayscale(args.input)
     
     # Run pipeline
     print("Running palm vein feature extraction pipeline...")
@@ -718,25 +727,8 @@ Examples:
     # Save intermediates if requested
     if args.all:
         # Re-run to get intermediates
-        hand_mask, safe_mask = segmentation_hand_mask(gray)
-
-        gray_pre = gray
-        if args.enhance_illumination:
-            gray_pre = pre_enhance_input(
-                gray, safe_mask,
-                denoise=args.denoise,
-                denoise_method=args.denoise_method,
-                denoise_strength=args.denoise_strength,
-                apply_clahe=True,
-                clahe_clip_limit=1.5,
-                clahe_tile_grid_size=(8, 8),
-                contrast_alpha=1.05,
-                contrast_beta=0,
-                gamma=None,
-                sharpen=False
-            )
-
-        hp = illumination_correction(gray_pre, safe_mask)
+        hand_mask, safe_mask = create_hand_segmentation_mask(gray)
+        hp = illumination_correction(gray, safe_mask)
         
         if args.use_illumination:
             # Save illumination-corrected and enhanced versions
